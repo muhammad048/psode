@@ -1,10 +1,9 @@
-# Evolution_Algorithm_Code/utils/tools/resume.py
 """ Model creation / weight loading / state_dict helpers
 
 Based on Ross Wightman utils; patched to:
- - drop mismatched classifier heads (e.g., 100→10 classes) safely
+ - drop mismatched classifier heads safely
  - re-init head params when adapting checkpoints
- - be Python 3.8/3.9 typing compatible (uses Optional[...] instead of '|')
+ - be Python 3.8/3.9 typing compatible
 """
 import logging
 import os
@@ -16,18 +15,14 @@ import torch.nn as nn
 
 _logger = logging.getLogger(__name__)
 
-
 def _strip_module_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """Remove leading 'module.' added by DDP."""
     out = OrderedDict()
     for k, v in state_dict.items():
         name = k[7:] if k.startswith('module.') else k
         out[name] = v
     return out
 
-
 def _expected_out_features(model: nn.Module) -> Optional[int]:
-    """Infer classifier output dim from common heads."""
     if hasattr(model, 'fc') and isinstance(model.fc, nn.Linear):
         return model.fc.out_features
     for attr in ('classifier', 'head'):
@@ -41,13 +36,10 @@ def _expected_out_features(model: nn.Module) -> Optional[int]:
                 return last.out_features
     return None
 
-
 def _drop_head_if_mismatch(state_dict: Dict[str, torch.Tensor], model: nn.Module, log: bool) -> bool:
-    """Drop classifier params from state_dict if shape doesn't match model's head."""
     expected = _expected_out_features(model)
     if expected is None:
         return False
-
     dropped = False
     for prefix in ('fc.', 'classifier.', 'head.'):
         w_key, b_key = prefix + 'weight', prefix + 'bias'
@@ -63,9 +55,7 @@ def _drop_head_if_mismatch(state_dict: Dict[str, torch.Tensor], model: nn.Module
         )
     return dropped
 
-
 def _reinit_head(model: nn.Module, log: bool):
-    """Re-initialize the model classifier head(s)."""
     did = False
     if hasattr(model, 'fc') and isinstance(model.fc, nn.Linear):
         nn.init.normal_(model.fc.weight, std=0.01)
@@ -84,7 +74,6 @@ def _reinit_head(model: nn.Module, log: bool):
     if did and log:
         _logger.info("Re-initialized classifier head parameters for the current num_classes.")
 
-
 def load_state_dict(checkpoint_path, log_info: bool = True, use_ema: bool = False):
     if checkpoint_path and os.path.isfile(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
@@ -102,7 +91,6 @@ def load_state_dict(checkpoint_path, log_info: bool = True, use_ema: bool = Fals
             state_dict = checkpoint[state_dict_key]
             state_dict = _strip_module_prefix(state_dict)
         else:
-            # raw tensor dict
             state_dict = _strip_module_prefix(checkpoint) if isinstance(checkpoint, dict) else checkpoint
         if log_info:
             _logger.info("Loaded {} from checkpoint '{}'".format(state_dict_key, checkpoint_path))
@@ -111,29 +99,14 @@ def load_state_dict(checkpoint_path, log_info: bool = True, use_ema: bool = Fals
         _logger.error("No checkpoint found at '{}'".format(checkpoint_path))
         raise FileNotFoundError()
 
-
 def load_checkpoint(model: nn.Module, checkpoint_path: str,
                     log_info: bool = True, use_ema: bool = False, strict: bool = True):
-    """
-    Safe load:
-      1) loads state_dict (handles DDP prefixes),
-      2) drops mismatched classifier params if needed,
-      3) loads with strict=False when adapting heads,
-      4) re-inits head if we dropped / if head keys are missing.
-    """
     state_dict = load_state_dict(checkpoint_path, log_info, use_ema)
-
-    # drop mismatched head (e.g., ckpt 100 classes vs model 10 classes)
     dropped = _drop_head_if_mismatch(state_dict, model, log=log_info)
-
-    # Allow missing keys when adapting heads
     strict = False if dropped else bool(strict)
     missing, unexpected = model.load_state_dict(state_dict, strict=strict)
-
-    # If we dropped (or head missing), re-init head weights
     if dropped or any(k.startswith(('fc.', 'classifier.', 'head.')) for k in missing):
         _reinit_head(model, log=log_info)
-
     if log_info:
         _logger.info("Loaded  from checkpoint '{}'".format(checkpoint_path))
         if missing:
@@ -141,12 +114,8 @@ def load_checkpoint(model: nn.Module, checkpoint_path: str,
         if unexpected:
             _logger.info("Unexpected keys: {}".format(len(unexpected)))
 
-
 def resume_checkpoint(model: nn.Module, checkpoint_path: str,
                       optimizer=None, loss_scaler=None, log_info: bool = True):
-    """
-    Original resume flow, plus safe head adaptation (drop/re-init) like load_checkpoint.
-    """
     resume_epoch = None
     if os.path.isfile(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
@@ -157,10 +126,7 @@ def resume_checkpoint(model: nn.Module, checkpoint_path: str,
                 checkpoint_model_dict = _strip_module_prefix(checkpoint['state_dict'])
             else:
                 checkpoint_model_dict = _strip_module_prefix(checkpoint['model'])
-
-            # drop mismatched head if needed
             _drop_head_if_mismatch(checkpoint_model_dict, model, log=log_info)
-
             missing, unexpected = model.load_state_dict(checkpoint_model_dict, strict=False)
             if any(k.startswith(('fc.', 'classifier.', 'head.')) for k in missing):
                 _reinit_head(model, log=log_info)
@@ -178,13 +144,12 @@ def resume_checkpoint(model: nn.Module, checkpoint_path: str,
             if 'epoch' in checkpoint:
                 resume_epoch = checkpoint['epoch']
                 if 'version' in checkpoint and checkpoint['version'] > 1:
-                    resume_epoch += 1  # start at next epoch for newer saves
+                    resume_epoch += 1
 
             if log_info:
                 _logger.info("Loaded checkpoint '{}' (epoch {})".format(
                     checkpoint_path, checkpoint.get('epoch', '?')))
         else:
-            # raw tensor dict
             tensor_dict = _strip_module_prefix(checkpoint) if isinstance(checkpoint, dict) else checkpoint
             _drop_head_if_mismatch(tensor_dict, model, log=log_info)
             missing, unexpected = model.load_state_dict(tensor_dict, strict=False)

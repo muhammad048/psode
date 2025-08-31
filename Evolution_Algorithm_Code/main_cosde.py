@@ -4,27 +4,23 @@ import shutil
 import logging
 from datetime import datetime
 from collections import OrderedDict
-from contextlib import suppress
 from itertools import islice
 import numpy as np
 import random as pyrandom
+import math
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 
 from utils.snn_model import SEW
-import math
 from utils.data import population_info as pop_info
-from utils.models import create_model, load_checkpoint
 from utils.tools import resume
 from utils.tools.utility import *
 from utils.tools.option_de import args, args_text, amp_autocast, obtain_loader
-from utils.tools import spe
 from utils.tools.de import de
 from utils.tools.pso import PSOOptimizer
 from utils.tools.spe import model_dict_to_vector, model_vector_to_dict
-from utils.tools.plot_utils_ import plot_top1_vs_baseline
 from utils.tools import val
 from utils.tools.greedy_soup_ann import greedy_soup, test_ood, test_single_model_ood
 from spikingjelly.clock_driven import functional
@@ -36,54 +32,49 @@ def main():
     setup_default_logging(log_path=args.log_dir)
     logging.basicConfig(level=logging.DEBUG, filename=args.log_dir, filemode='a')
 
-    # ---- safer: args.rank may not exist in non-DDP runs
+    # rank may not exist outside DDP
     random_seed(args.seed, getattr(args, 'rank', 0))
 
-    # ---- dataloaders
+    # loaders
     _, loader_eval, loader_de = obtain_loader(args)
 
-    # ---- model (respect num_classes from args/dataset)
+    # val.validate expects args.slice_len
+    if not hasattr(args, 'slice_len'):
+        args.slice_len = getattr(args, 'de_slice_len', 0)
+
+    # model
     model = SEW.resnet34(num_classes=args.num_classes, g="add", down='max', T=4)
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if getattr(args, 'local_rank', 0) == 0:
         _logger.info(f"Creating model...{args.model}, number of params: {n_parameters}")
-    model = model.cuda()
-    model = model.to(memory_format=torch.channels_last)
+    model = model.cuda().to(memory_format=torch.channels_last)
 
-    # ---- optionally resume from checkpoints list
+    # seed population from checkpoints
     load_score = False
     models_path = []
-
     if getattr(args, 'pop_init', None):
         base = os.path.basename(args.pop_init)
         if base.split('_')[-1] == 'score.txt':
-            # score file → also returns path list
             load_score = True
             score, acc1, acc5, val_loss, en_metrics, models_path = pop_info.get_path_with_acc(args.pop_init)
         else:
-            # directory of checkpoints
             models_path = pop_info.get_path(args.pop_init)
 
-    # Fallback (kept for compatibility): hard-coded paths if nothing provided
     if not models_path:
+        # fallback: replicate one ckpt if none given
         models_path = [
             r"E:\PSO\PSOCADE4SNN-main\finetune_hyperparameter\checkpoints\train\20250825-211457-exp_debug\exp_debug_0.pt",
-            r"E:\PSO\PSOCADE4SNN-main\finetune_hyperparameter\checkpoints\train\20250825-211457-exp_debug\exp_debug_0.pt",
-            r"E:\PSO\PSOCADE4SNN-main\finetune_hyperparameter\checkpoints\train\20250825-211457-exp_debug\exp_debug_0.pt",
-            r"E:\PSO\PSOCADE4SNN-main\finetune_hyperparameter\checkpoints\train\20250825-211457-exp_debug\exp_debug_0.pt",
-            r"E:\PSO\PSOCADE4SNN-main\finetune_hyperparameter\checkpoints\train\20250825-211457-exp_debug\exp_debug_0.pt",
-            r"E:\PSO\PSOCADE4SNN-main\finetune_hyperparameter\checkpoints\train\20250825-211457-exp_debug\exp_debug_0.pt",
-        ]
+        ] * max(1, args.popsize)
 
-    # ---------- load population -------------
     population = []
     for resume_path in models_path:
-        print(resume_path)
+        if getattr(args, 'local_rank', 0) == 0:
+            print(resume_path)
         resume.load_checkpoint(model, resume_path, log_info=getattr(args, 'local_rank', 0) == 0)
         solution = model_dict_to_vector(model).detach()
         population.append(solution)
 
-    # ---- Ensure diversity: add small Gaussian noise if all individuals are (nearly) identical
+    # diversity injection if all clones
     try:
         if len(population) >= 2:
             _stack = torch.stack(population)
@@ -97,12 +88,12 @@ def main():
         if getattr(args, 'local_rank', 0) == 0:
             _logger.warning(f"Gaussian diversity injection skipped due to error: {_e}")
 
-    # ---- optional DDP wrapping
+    # optional DDP
     if getattr(args, 'distributed', False):
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = NativeDDP(model, device_ids=[getattr(args, 'local_rank', 0)])
 
-    # ---- output dir & snapshot code
+    # output dir snapshot
     if getattr(args, 'local_rank', 0) == 0:
         output_base = args.output if args.output else './output'
         exp_name = '-'.join([datetime.now().strftime("%Y%m%d-%H%M%S"), args.exp_name])
@@ -112,16 +103,12 @@ def main():
         shutil.copytree(os.path.join(current_dir, 'utils'), os.path.join(output_dir, 'utils'))
         for filename in os.listdir(current_dir):
             if filename.endswith('.py') or filename.endswith('.sh'):
-                src_path = os.path.join(current_dir, filename)
-                dst_path = os.path.join(output_dir, filename)
-                shutil.copy(src_path, dst_path)
+                shutil.copy(os.path.join(current_dir, filename), os.path.join(output_dir, filename))
         with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
             f.write(args_text)
 
-    # ---- baseline scoring & logging
+    # baseline scoring
     args.popsize = len(models_path)
-
-    # Initialize placeholders (safe for all branches)
     acc1, acc5, val_loss = [torch.zeros(args.popsize).tolist() for _ in range(3)]
 
     if not load_score:
@@ -142,12 +129,10 @@ def main():
 
         en_metrics = val.validate_ensemble(model, population, args.popsize, loader_eval, args, amp_autocast=amp_autocast)
 
-        # Only write if we have a destination; avoid crashing on None
         if getattr(args, 'pop_init', None):
             pop_info.write_path_with_acc(score, acc1, acc5, val_loss, en_metrics, models_path, args.pop_init)
     else:
-        # score/acc1/acc5/val_loss already loaded via get_path_with_acc
-        en_metrics = en_metrics  # keep name for logging below
+        en_metrics = en_metrics
 
     if getattr(args, 'local_rank', 0) == 0:
         update_summary('baselines:', OrderedDict(en_metrics), os.path.join(args.output_dir, 'summary.csv'), write_header=True)
@@ -161,12 +146,9 @@ def main():
         _logger.info('epoch:{}, best_score:{:>7.4f}, best_idx:{}, score: {}'.format(0, max(score), bestidx, score))
         update_summary(0, rowd, os.path.join(args.output_dir, 'summary.csv'), write_header=True)
 
-    # ***********************************************************************************************************
-    popsize = args.popsize
-    max_iters = args.de_epochs
     print("score", score)
 
-    # ---- Optional PSO phase to select (F, CR) before DE ----
+    # ---- PSO: tune (F, CR) before DE (maximization) ----
     f, cr = args.f_init, args.cr_init
     if getattr(args, 'use_pso', False):
         if getattr(args, 'local_rank', 0) == 0:
@@ -177,35 +159,34 @@ def main():
             _temp_pop = [p.clone() for p in population]
             _best_scores = []
             for _ in range(max(1, args.pso_eval_gens)):
-                _temp_pop, _upd, _scores = de(popsize, _F, _CR, _temp_pop, model, loader_de, args)
+                _temp_pop, _upd, _scores = de(args.popsize, _F, _CR, _temp_pop, model, loader_de, args)
                 try:
                     _best_scores.append(float(max(_scores)))
                 except Exception:
                     _best_scores.append(0.0)
-            return (float(np.mean(_best_scores)), 0.0)  # (acc, dummy_precision)
+            return float(np.mean(_best_scores))  # maximize accuracy
 
         _pso = PSOOptimizer(pop_size=args.pso_popsize, F_bounds=(0.1, 0.9), CR_bounds=(0.1, 0.99), max_iters=args.pso_iters)
-        _bestF, _bestCR, _ = _pso.optimize(_eval_particle)
-        f, cr = float(_bestF), float(_bestCR)
+        gbest, gbest_fit = _pso.optimize(_eval_particle)
+        f, cr = float(gbest[0]), float(gbest[1])
         if getattr(args, 'local_rank', 0) == 0:
-            _logger.info(f"PSO selected F={f:.4f}, CR={cr:.4f}")
+            _logger.info(f"PSO selected F={f:.4f}, CR={cr:.4f} (fitness={gbest_fit:.4f})")
     else:
         if getattr(args, 'local_rank', 0) == 0:
             _logger.info(f"Using initial F={f:.4f}, CR={cr:.4f} without PSO")
 
-    f_cr_threshold = 0
     max_acc_train = 0
     max_acc_val = 0
 
-    # ---- Use ALL generations requested
+    # ---- DE generations (use all) ----
     for epoch in range(args.de_epochs):
         epoch_time = AverageMeter()
         end = time.time()
 
         print("cr f", cr, f)
-        population, update_label, score = de(popsize, f, cr, population, model, loader_de, args)
+        population, update_label, score = de(args.popsize, f, cr, population, model, loader_de, args)
 
-        # Adjust (f, cr) per-epoch only if PSO is disabled
+        # cosine drift for F/CR only if PSO disabled
         if not getattr(args, 'use_pso', False):
             fcr_min = 1e-6
             f = fcr_min + (args.f_init - fcr_min) * (1 + math.cos(math.pi * epoch / 40)) / 2 + pyrandom.uniform(fcr_min, args.f_init)
@@ -222,7 +203,7 @@ def main():
                 print('Saving model to', model_path)
                 torch.save(model.state_dict(), model_path)
         else:
-            update_label = list(range(popsize))
+            update_label = list(range(args.popsize))
             pop_tensor = torch.stack(population)
 
         if getattr(args, 'distributed', False):
@@ -233,7 +214,7 @@ def main():
 
         population = list(pop_tensor)
 
-        for i in range(popsize):
+        for i in range(args.popsize):
             if update_label[i] == 1:
                 solution = population[i]
                 model_weights_dict = model_vector_to_dict(model=model, weights_vector=solution)
@@ -256,13 +237,11 @@ def main():
         if getattr(args, 'local_rank', 0) == 0:
             rowd = OrderedDict([('best_idx', bestidx), ('score', score), ('top1', acc1), ('top5', acc5), ('val_loss', val_loss)])
             update_summary(epoch, rowd, os.path.join(args.output_dir, 'summary.csv'), write_header=True)
-            bestidx_tensor = torch.tensor(bestidx).cuda()
-            if args.de_epochs - popsize <= epoch <= args.de_epochs - 1:
+            if args.de_epochs - args.popsize <= epoch <= args.de_epochs - 1:
                 model_path = os.path.join(args.output_dir, f'{args.exp_name}_{epoch}.pt')
                 print('Saving model to', model_path)
                 torch.save(model.state_dict(), model_path)
 
-    # ---- tidy W&B if present
     try:
         import wandb
         wandb.finish()
@@ -292,6 +271,7 @@ def score_func(model, population, loader_de, args):
             input = input.contiguous(memory_format=torch.channels_last)
             with amp_autocast():
                 output, _ = model(input)
+            from spikingjelly.clock_driven import functional
             functional.reset_net(model)
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
             if getattr(args, 'distributed', False):
@@ -306,7 +286,7 @@ def score_func(model, population, loader_de, args):
         print('data_time: {time1.val:.3f} ({time1.avg:.3f})  '
               'batch_time: {time2.val:.3f} ({time2.avg:.3f})  '.format(time1=data_time_m, time2=batch_time_m))
 
-    score = [i.cpu() / slice_len for i in acc1_all]  # !!! accuracy as score
+    score = [i.cpu() / slice_len for i in acc1_all]
     return score
 
 
