@@ -1,17 +1,91 @@
+# Evolution_Algorithm_Code/utils/tools/resume.py
 """ Model creation / weight loading / state_dict helpers
 
-Hacked together by / Copyright 2020 Ross Wightman
+Based on Ross Wightman utils; patched to:
+ - drop mismatched classifier heads (e.g., 100→10 classes) safely
+ - re-init head params when adapting checkpoints
+ - be Python 3.8/3.9 typing compatible (uses Optional[...] instead of '|')
 """
 import logging
 import os
 from collections import OrderedDict
+from typing import Dict, Any, Optional
+
 import torch
-from sympy import false
+import torch.nn as nn
 
 _logger = logging.getLogger(__name__)
 
 
-def load_state_dict(checkpoint_path, log_info=True, use_ema=False):
+def _strip_module_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Remove leading 'module.' added by DDP."""
+    out = OrderedDict()
+    for k, v in state_dict.items():
+        name = k[7:] if k.startswith('module.') else k
+        out[name] = v
+    return out
+
+
+def _expected_out_features(model: nn.Module) -> Optional[int]:
+    """Infer classifier output dim from common heads."""
+    if hasattr(model, 'fc') and isinstance(model.fc, nn.Linear):
+        return model.fc.out_features
+    for attr in ('classifier', 'head'):
+        mod = getattr(model, attr, None)
+        if mod is not None:
+            last = None
+            for m in mod.modules():
+                if isinstance(m, nn.Linear):
+                    last = m
+            if last is not None:
+                return last.out_features
+    return None
+
+
+def _drop_head_if_mismatch(state_dict: Dict[str, torch.Tensor], model: nn.Module, log: bool) -> bool:
+    """Drop classifier params from state_dict if shape doesn't match model's head."""
+    expected = _expected_out_features(model)
+    if expected is None:
+        return False
+
+    dropped = False
+    for prefix in ('fc.', 'classifier.', 'head.'):
+        w_key, b_key = prefix + 'weight', prefix + 'bias'
+        if w_key in state_dict:
+            if state_dict[w_key].shape[0] != expected:
+                state_dict.pop(w_key, None)
+                state_dict.pop(b_key, None)
+                dropped = True
+    if dropped and log:
+        _logger.info(
+            "Dropped classifier params from checkpoint due to class-count mismatch "
+            f"(expected out_features={expected})."
+        )
+    return dropped
+
+
+def _reinit_head(model: nn.Module, log: bool):
+    """Re-initialize the model classifier head(s)."""
+    did = False
+    if hasattr(model, 'fc') and isinstance(model.fc, nn.Linear):
+        nn.init.normal_(model.fc.weight, std=0.01)
+        if model.fc.bias is not None:
+            nn.init.zeros_(model.fc.bias)
+        did = True
+    for attr in ('classifier', 'head'):
+        mod = getattr(model, attr, None)
+        if mod is not None:
+            for m in mod.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.normal_(m.weight, std=0.01)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+                    did = True
+    if did and log:
+        _logger.info("Re-initialized classifier head parameters for the current num_classes.")
+
+
+def load_state_dict(checkpoint_path, log_info: bool = True, use_ema: bool = False):
     if checkpoint_path and os.path.isfile(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
         state_dict_key = ''
@@ -26,14 +100,10 @@ def load_state_dict(checkpoint_path, log_info=True, use_ema=False):
                 state_dict_key = 'model'
         if state_dict_key:
             state_dict = checkpoint[state_dict_key]
-            new_state_dict = OrderedDict()
-            for k, v in state_dict.items():
-                # strip `module.` prefix
-                name = k[7:] if k.startswith('module') else k
-                new_state_dict[name] = v
-            state_dict = new_state_dict
+            state_dict = _strip_module_prefix(state_dict)
         else:
-            state_dict = checkpoint
+            # raw tensor dict
+            state_dict = _strip_module_prefix(checkpoint) if isinstance(checkpoint, dict) else checkpoint
         if log_info:
             _logger.info("Loaded {} from checkpoint '{}'".format(state_dict_key, checkpoint_path))
         return state_dict
@@ -42,44 +112,65 @@ def load_state_dict(checkpoint_path, log_info=True, use_ema=False):
         raise FileNotFoundError()
 
 
-def load_checkpoint(model, checkpoint_path, log_info=True, use_ema=False, strict=True):
-    if os.path.splitext(checkpoint_path)[-1].lower() in ('.npz', '.npy'):
-        # numpy checkpoint, try to load via model specific load_pretrained fn
-        if hasattr(model, 'load_pretrained'):
-            model.load_pretrained(checkpoint_path)
-        else:
-            raise NotImplementedError('Model cannot load numpy checkpoint')
-        return
+def load_checkpoint(model: nn.Module, checkpoint_path: str,
+                    log_info: bool = True, use_ema: bool = False, strict: bool = True):
+    """
+    Safe load:
+      1) loads state_dict (handles DDP prefixes),
+      2) drops mismatched classifier params if needed,
+      3) loads with strict=False when adapting heads,
+      4) re-inits head if we dropped / if head keys are missing.
+    """
     state_dict = load_state_dict(checkpoint_path, log_info, use_ema)
-    model.load_state_dict(state_dict, strict=False)
+
+    # drop mismatched head (e.g., ckpt 100 classes vs model 10 classes)
+    dropped = _drop_head_if_mismatch(state_dict, model, log=log_info)
+
+    # Allow missing keys when adapting heads
+    strict = False if dropped else bool(strict)
+    missing, unexpected = model.load_state_dict(state_dict, strict=strict)
+
+    # If we dropped (or head missing), re-init head weights
+    if dropped or any(k.startswith(('fc.', 'classifier.', 'head.')) for k in missing):
+        _reinit_head(model, log=log_info)
+
+    if log_info:
+        _logger.info("Loaded  from checkpoint '{}'".format(checkpoint_path))
+        if missing:
+            _logger.info("Missing keys: {}".format(len(missing)))
+        if unexpected:
+            _logger.info("Unexpected keys: {}".format(len(unexpected)))
 
 
-def resume_checkpoint(model, checkpoint_path, optimizer=None, loss_scaler=None, log_info=True):
+def resume_checkpoint(model: nn.Module, checkpoint_path: str,
+                      optimizer=None, loss_scaler=None, log_info: bool = True):
+    """
+    Original resume flow, plus safe head adaptation (drop/re-init) like load_checkpoint.
+    """
     resume_epoch = None
     if os.path.isfile(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
         if isinstance(checkpoint, dict) and ('state_dict' in checkpoint or 'model' in checkpoint):
             if log_info:
                 _logger.info('Restoring model state from checkpoint...')
-            new_state_dict = OrderedDict()
             if 'state_dict' in checkpoint:
-                checkpoint_model_dict = checkpoint['state_dict']
-                for k, v in checkpoint_model_dict.items():
-                    name = k[7:] if k.startswith('module') else k
-                    new_state_dict[name] = v
+                checkpoint_model_dict = _strip_module_prefix(checkpoint['state_dict'])
             else:
-                checkpoint_model_dict = checkpoint['model']
-                for k, v in checkpoint_model_dict.items():
-                    name = ''.join(k.split('module.'))
-                    new_state_dict[name] = v
-            model.load_state_dict(new_state_dict) 
+                checkpoint_model_dict = _strip_module_prefix(checkpoint['model'])
+
+            # drop mismatched head if needed
+            _drop_head_if_mismatch(checkpoint_model_dict, model, log=log_info)
+
+            missing, unexpected = model.load_state_dict(checkpoint_model_dict, strict=False)
+            if any(k.startswith(('fc.', 'classifier.', 'head.')) for k in missing):
+                _reinit_head(model, log=log_info)
 
             if optimizer is not None and 'optimizer' in checkpoint:
                 if log_info:
                     _logger.info('Restoring optimizer state from checkpoint...')
                 optimizer.load_state_dict(checkpoint['optimizer'])
 
-            if loss_scaler is not None and loss_scaler.state_dict_key in checkpoint:
+            if loss_scaler is not None and getattr(loss_scaler, 'state_dict_key', None) in checkpoint:
                 if log_info:
                     _logger.info('Restoring AMP loss scaler state from checkpoint...')
                 loss_scaler.load_state_dict(checkpoint[loss_scaler.state_dict_key])
@@ -87,16 +178,21 @@ def resume_checkpoint(model, checkpoint_path, optimizer=None, loss_scaler=None, 
             if 'epoch' in checkpoint:
                 resume_epoch = checkpoint['epoch']
                 if 'version' in checkpoint and checkpoint['version'] > 1:
-                    resume_epoch += 1  # start at the next epoch, old checkpoints incremented before save
+                    resume_epoch += 1  # start at next epoch for newer saves
 
             if log_info:
-                _logger.info("Loaded checkpoint '{}' (epoch {})".format(checkpoint_path, checkpoint['epoch']))
+                _logger.info("Loaded checkpoint '{}' (epoch {})".format(
+                    checkpoint_path, checkpoint.get('epoch', '?')))
         else:
-            model.load_state_dict(checkpoint)
+            # raw tensor dict
+            tensor_dict = _strip_module_prefix(checkpoint) if isinstance(checkpoint, dict) else checkpoint
+            _drop_head_if_mismatch(tensor_dict, model, log=log_info)
+            missing, unexpected = model.load_state_dict(tensor_dict, strict=False)
+            if any(k.startswith(('fc.', 'classifier.', 'head.')) for k in missing):
+                _reinit_head(model, log=log_info)
             if log_info:
                 _logger.info("Loaded checkpoint '{}'".format(checkpoint_path))
         return resume_epoch
     else:
         _logger.error("No checkpoint found at '{}'".format(checkpoint_path))
         raise FileNotFoundError()
-

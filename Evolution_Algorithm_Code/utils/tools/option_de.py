@@ -1,213 +1,244 @@
+# Evolution_Algorithm_Code/utils/tools/option_de.py
 import argparse
-from utils.tools import template
-import yaml
 import os
+import random
+from typing import Tuple, Optional
+from contextlib import contextmanager
+
 import torch
-import logging
-from contextlib import suppress
-from utils.tools.utility import NativeScaler
-from utils.data.cifar_loader import create_loader_cifar
-from utils.data.imagenet_loader import create_loader
-_logger = logging.getLogger(__name__)
+from torch.utils.data import DataLoader
+import torchvision
+import torchvision.transforms as T
 
-# The first arg parser parses out only the --config argument, this argument is used to
-# load a yaml file containing key-values that override the defaults for the main parser below
-config_parser = parser = argparse.ArgumentParser(description='Training Config', add_help=False)
-parser.add_argument('-c', '--config', default=None, type=str, metavar='FILE',
-                    help='YAML config file specifying default arguments')   #'imagenet.yml'
+# ----------------------------
+# AMP compatibility wrapper
+# ----------------------------
+# Use torch.amp.autocast('cuda') if available, else fall back to torch.cuda.amp.autocast()
+try:
+    from torch.amp import autocast as _torch_amp_autocast
 
-parser = argparse.ArgumentParser(description='Finetune Training and Evaluating')
-parser.add_argument('--template', default='.',
-                    help='You can set various templates in option.py')
+    def amp_autocast():
+        return _torch_amp_autocast('cuda')
+except Exception:
+    try:
+        from torch.cuda.amp import autocast as _cuda_amp_autocast
 
-# Dataset / Model parameters
-parser.add_argument('--data', default='/data/dataset/imagenet',
-                    help='path to dataset')
-parser.add_argument('--exp_name', default='exp_debug', type=str, metavar='EXP',
-                    help='path to exp_name folder (default: exp_debug, current dir)')
-parser.add_argument('--model', default='resnet18', type=str, metavar='MODEL',
-                    help='Name of model to train (default: "countception"')
-parser.add_argument('--resume', default='', type=str, metavar='PATH',
-                    help='Resume full model and optimizer state from checkpoint (default: none)')
-parser.add_argument('--only_test', action='store_true', default=False,
-                    help='if test only')
-parser.add_argument('--num_classes', type=int, default=1000, metavar='N',
-                    help='number of label classes (default: 1000)')
-parser.add_argument('--img_size', type=int, default=224, metavar='N',
-                    help='Image patch size (default: None => model default)')
-parser.add_argument('--crop_pct', default=None, type=float,
-                    metavar='N', help='Input image center crop percent (for validation only)')
-parser.add_argument('-b', '--batch_size', type=int, default=32, metavar='N',
-                    help='input batch size for training (default: 32)')
-parser.add_argument('-vb', '--val_batch_size', type=int, default=96, metavar='N',
-                    help='ratio of validation batch size to training batch size (default: 1)')
+        def amp_autocast():
+            return _cuda_amp_autocast()
+    except Exception:
+        @contextmanager
+        def amp_autocast():
+            yield  # no-op if AMP isn't available
 
-# Augmentation & regularization parameters
-parser.add_argument('--aa', type=str, default=None, metavar='NAME',
-                    help='Use AutoAugment policy. "v0" or "original or rand-m9-mstd0.5-inc1". (default: None)'),
 
-# Misc
-parser.add_argument('--seed', type=int, default=42, metavar='S',
-                    help='random seed (default: 42)')
-parser.add_argument('--log_interval', type=int, default=50, metavar='N',
-                    help='how many batches to wait before logging training status')
-parser.add_argument('-j', '--workers', type=int, default=2, metavar='N',
-                    help='how many training processes to use (default: 1)')
-parser.add_argument('-j_val', '--val_workers', type=int, default=2, metavar='N',
-                    help='how many training processes to use (default: 1)')
-parser.add_argument('--num-gpu', type=int, default=1,
-                    help='Number of GPUS to use')
-parser.add_argument('--amp', action='store_true', default=False,
-                    help='use NVIDIA Apex AMP or Native AMP for mixed precision training')
-parser.add_argument('--output', default='/data/guodong/evo/output/', type=str, metavar='PATH',
-                    help='path to output folder (default: none, current dir)')
-parser.add_argument('--log_dir', default='/home/guodong/evo/log_out/demo.txt',
-                    help='path to dataset')
-# parser.add_argument("--local_rank", default=0, type=int)
-parser.add_argument("--local-rank", default=0, type=int)
+# ----------------------------
+# Argument parser
+# ----------------------------
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Options for DE/PSO + CADE pipeline")
 
-parser.add_argument('--slice_len', type=int, default=0, metavar='slice_len',
-                    help='slice_len (default: 0)')
+    # Data / IO
+    parser.add_argument('--data', default='./data', type=str,
+                        help='dataset root directory (download target if missing)')
+    parser.add_argument('--dataset', default=None, choices=[None, 'cifar10', 'cifar100'],
+                        help='explicit dataset selection; if None, inferred from --num_classes')
+    parser.add_argument('--num_classes', default=100, type=int,
+                        help='number of classes (10 → CIFAR-10, 100 → CIFAR-100)')
+    parser.add_argument('--output', default='./cade_results', type=str,
+                        help='output directory for artifacts')
+    parser.add_argument('--log_dir', default='./cade_results/log.txt', type=str,
+                        help='path to a log file (will be created if missing)')
+    parser.add_argument('--exp_name', default='exp_debug', type=str,
+                        help='experiment tag for output dir names')
+    parser.add_argument('--model', default='SEW_resnet34', type=str,
+                        help='label used in saved filenames')
 
-# DE parameters
-parser.add_argument('--de_slice_len', type=int, default=20000, metavar='N',
-                    help='number of label classes (default: 20000)')
-parser.add_argument('--de_batch_size', type=int, default=256, metavar='N',
-                    help='number of label classes (default: 1000)')
-parser.add_argument('--de_epochs', type=int, default=300, metavar='N',
-                    help='number of label classes (default: 1000)')
-parser.add_argument('--popsize', type=int, default=10, metavar='N',
-                    help='number of label classes (default: 1000)')
-parser.add_argument('--pop_init', default='/home/guodong/ImageNet',
-                    help='path to dataset')
-parser.add_argument('--shade_mem', type=int, default=5,
-                    help='memory size of archive in shade')
-parser.add_argument('--shade_lp', type=int, default=5,
-                    help='lp in shade')
-parser.add_argument('--trig_perc', type=float, default=0.2,
-                    help='Override std deviation of of dataset')
-parser.add_argument('--cr_init', type=float, default=0.8,
-                    help='initial value of crossover rate cr')
-parser.add_argument('--cr_std', type=float, default=0.05,
-                    help='Override std deviation of of dataset')
-parser.add_argument('--cr_clip', type=float, default=0.99,
-                    help='Override std deviation of of dataset')
-parser.add_argument('--f_init', type=float, default=0.6,
-                    help='Override std deviation of of dataset')
-parser.add_argument('--f_std', type=float, default=0.05,
-                    help='Override std deviation of of dataset')
-parser.add_argument('--f_clip', type=float, default=0.99,
-                    help='Override std deviation of of dataset')
-parser.add_argument('--freq_init', type=float, default=0.5,
-                    help='Override std deviation of of dataset')
-parser.add_argument('--freq_std', type=float, default=0.1,
-                    help='Override std deviation of of dataset')
-parser.add_argument('--test_ood', action='store_true', default=False,
-                    help='process test on ood')
-parser.add_argument('--ood_path', default='/home/guodong/runhua/ood_dataset',
-                    help='path to ood dataset')
-# parser.add_argument('--skip-init-validate', action='store_true', default=False,
-#                     help='skip the initial pop validation')
-# parser.add_argument('--skip-pop-validate', action='store_true', default=False,
-#                     help='skip the pop validation')
-# parser.add_argument('--replace-pop-after-epoch', action='store_true', default=False,
-#                     help='replace half pop to initial pop after an epoch')
-# parser.add_argument('--noise-parent', action='store_true', default=False,
-#                     help='using noise to generate parents')
-# parser.add_argument('--restrict-para', action='store_true', default=False,
-#                     help='restrict the trainable parameters in DE')
-# parser.add_argument('--validate-every-iter', action='store_true', default=False,
-#                     help='validate the result for every iteration, otherwise every batch')
-# parser.add_argument('--resume-parents', action='store_true', default=False,
-#                     help='resume parent according to the parent_pop_dir')
-# parser.add_argument('--validate_interval', type=int, default=1, metavar='N',
-#                     help='no of epoch between validation')
+    # Compute / performance
+    parser.add_argument('--num-gpu', default=1, type=int, metavar='N',
+                        help='number of GPUs to use')
+    parser.add_argument('-j', '--workers', default=2, type=int, metavar='N',
+                        help='data loading workers for train/DE')
+    parser.add_argument('-j_val', '--workers_val', default=2, type=int, metavar='N',
+                        help='data loading workers for validation/eval')
+    parser.add_argument('--amp', action='store_true',
+                        help='enable mixed precision (AMP)')
+    parser.add_argument('--seed', default=42, type=int, help='random seed (<=0 to disable)')
 
-def _parse_args(config_parser):
-    # Do we have a config file to parse?
-    args_config, remaining = config_parser.parse_known_args()
-    if args_config.config:
-        with open(args_config.config, 'r') as f:
-            cfg = yaml.safe_load(f)
-            parser.set_defaults(**cfg)
+    # Distributed toggles (safe defaults even if you don't use DDP)
+    parser.add_argument('--rank', default=0, type=int, help='global rank (DDP)')
+    parser.add_argument('--local_rank', default=0, type=int, help='local rank (DDP)')
+    parser.add_argument('--world_size', default=1, type=int, help='world size (DDP)')
+    parser.add_argument('--distributed', action='store_true', help='enable DDP mode')
 
-    # The main arg parser parses the rest of the args, the usual
-    # defaults will have been overridden if config file specified.
-    args = parser.parse_args(remaining)
+    # Evolutionary search
+    parser.add_argument('--popsize', default=20, type=int, help='population size')
+    parser.add_argument('--de_epochs', default=50, type=int,
+                        help='number of DE generations (use range(args.de_epochs))')
+    parser.add_argument('--de_batch_size', default=128, type=int,
+                        help='mini-batch size used for DE/fitness evaluation')
+    parser.add_argument('--test_batch_size', default=256, type=int,
+                        help='mini-batch size used for validation/testing')
+    parser.add_argument('--de_slice_len', default=0, type=int,
+                        help='>0 to cap DE eval batches; 0 uses full loader')
+    parser.add_argument('--pop_init', default=None, type=str,
+                        help='directory with ≥popsize checkpoints to seed initial population')
+    parser.add_argument('--f_init', default=0.5, type=float, help='initial DE mutation factor F')
+    parser.add_argument('--cr_init', default=0.9, type=float, help='initial DE crossover rate CR')
 
-    # Cache the args as a text string to save them in the output dir later
-    args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
-    return args, args_text
+    # PSO controller for (F, CR)
+    parser.add_argument('--use_pso', action='store_true',
+                        help='run a short PSO to select (F, CR) before DE')
+    parser.add_argument('--pso_popsize', default=8, type=int, help='PSO swarm size')
+    parser.add_argument('--pso_iters', default=10, type=int, help='PSO iterations')
+    parser.add_argument('--pso_eval_gens', default=3, type=int,
+                        help='cheap DE generations per PSO fitness evaluation')
 
-args, args_text = _parse_args(config_parser)
-template.set_template(args)
+    # Misc
+    parser.add_argument('--test_ood', action='store_true', help='run OOD code paths if present')
 
-# if args.epochs == 0: args.epochs = 1e8
-for arg in vars(args):
-    if vars(args)[arg] == 'True':
-        vars(args)[arg] = True
-    elif vars(args)[arg] == 'False':
-        vars(args)[arg] = False
+    return parser
 
-if getattr(torch.cuda.amp, 'autocast') is None:
-    _logger.warning('amp have no autocast!')
-args.distributed = False
 
-if 'WORLD_SIZE' in os.environ:
-    args.distributed = int(os.environ['WORLD_SIZE']) > 1
-    print('distributed:', args.distributed)
-    if args.distributed and args.num_gpu > 1:
-         _logger.warning(
-             'Using more than one GPU per process in distributed mode is not allowed. Setting num_gpu to 1.')
-         args.num_gpu = 1
+parser = _build_parser()
+# Parse at import time to keep the original project pattern:
+args = parser.parse_args()
 
-args.device = 'cuda:0'
-args.world_size = 1
-args.rank = 0  # global rank
-if args.distributed:
-   args.num_gpu = 1
-   args.device = 'cuda:%d' % args.local_rank
-   torch.cuda.set_device(args.local_rank)
-   torch.distributed.init_process_group(backend='nccl', init_method='env://')
-   args.world_size = torch.distributed.get_world_size()
-   args.rank = torch.distributed.get_rank()
-assert args.rank >= 0
 
-if args.distributed:
-    _logger.info('Training in distributed mode with multiple processes, 1 GPU per process. Process %d, total %d.'
-                 % (args.rank, args.world_size))
-else:
-    _logger.info('Training with a single process on %d GPUs.' % args.num_gpu)
+# args_text (string) expected by main_cosde.py (simple YAML-like dump)
+def _format_args(a) -> str:
+    lines = []
+    for k, v in sorted(vars(a).items()):
+        lines.append(f"{k}: {v}")
+    return "\n".join(lines)
+args_text = _format_args(args)
 
-amp_autocast = suppress  # do nothing
-loss_scaler = None
-if args.amp == True:
-    amp_autocast = torch.cuda.amp.autocast
-    loss_scaler = NativeScaler()
-    if args.local_rank == 0:
-        _logger.info('Using native Torch AMP. Training in mixed precision.')
-else:
-    if args.local_rank == 0:
-        _logger.info('AMP not enabled. Training in float32.')
 
-def obtain_loader(args):
-    if args.num_classes == 1000:
-        loader_train = create_loader(data=args.data, name='train98p', batch_size=args.batch_size,
-                                    num_workers=args.workers,
-                                    is_training=True, img_size=args.img_size,
-                                    auto_augment=args.aa, distributed=args.distributed)
-        loader_eval = create_loader(data=args.data, name='val', batch_size=args.val_batch_size,
-                                    num_workers=args.val_workers,
-                                    is_training=False, img_size=args.img_size, 
-                                    auto_augment=None, distributed=args.distributed)
-        loader_de = create_loader(data=args.data, name='train2p', batch_size=args.de_batch_size,
-                                    num_workers=args.val_workers,
-                                    is_training=False, img_size=args.img_size,
-                                    auto_augment=None, distributed=args.distributed)
-    if args.num_classes == 100:
-        print("create dataset: cifar100")
-        loader_train,loader_eval,loader_de = create_loader_cifar(args)
+# ----------------------------
+# Utilities
+# ----------------------------
+def _set_seed(seed: int):
+    if seed and seed > 0:
+        random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+def _infer_dataset_name(num_classes: int) -> str:
+    return 'cifar10' if int(num_classes) == 10 else 'cifar100'
+
+
+def _cifar_stats(name: str) -> Tuple[list, list]:
+    if name == 'cifar10':
+        mean = [0.4914, 0.4822, 0.4465]
+        std  = [0.2470, 0.2435, 0.2616]
+    else:
+        # CIFAR-100
+        mean = [0.5071, 0.4867, 0.4408]
+        std  = [0.2675, 0.2565, 0.2761]
+    return mean, std
+
+
+def _build_transforms(name: str):
+    mean, std = _cifar_stats(name)
+    train_tf = T.Compose([
+        T.RandomCrop(32, padding=4),
+        T.RandomHorizontalFlip(),
+        T.ToTensor(),
+        T.Normalize(mean, std),
+    ])
+    eval_tf = T.Compose([
+        T.ToTensor(),
+        T.Normalize(mean, std),
+    ])
+    return train_tf, eval_tf
+
+
+def _build_cifar_loaders(name: str,
+                         root: str,
+                         train_bs: int,
+                         test_bs: int,
+                         workers_train: int,
+                         workers_val: int):
+    train_tf, eval_tf = _build_transforms(name)
+    os.makedirs(root, exist_ok=True)
+
+    if name == 'cifar10':
+        train_set = torchvision.datasets.CIFAR10(root=root, train=True,  transform=train_tf, download=True)
+        val_set   = torchvision.datasets.CIFAR10(root=root, train=False, transform=eval_tf,  download=True)
+        classes = 10
+    else:
+        train_set = torchvision.datasets.CIFAR100(root=root, train=True,  transform=train_tf, download=True)
+        val_set   = torchvision.datasets.CIFAR100(root=root, train=False, transform=eval_tf,  download=True)
+        classes = 100
+
+    train_loader = DataLoader(
+        train_set, batch_size=train_bs, shuffle=True,
+        num_workers=max(0, workers_train), pin_memory=True, drop_last=True
+    )
+    val_loader = DataLoader(
+        val_set, batch_size=test_bs, shuffle=False,
+        num_workers=max(0, workers_val), pin_memory=True, drop_last=False
+    )
+    # For DE/PSO fitness, we typically use the train (or a subset) loader
+    de_loader = train_loader
+    return classes, train_loader, val_loader, de_loader
+
+
+# ----------------------------
+# Loader entrypoint
+# ----------------------------
+def obtain_loader(a=args):
+    """
+    Returns (loader_train, loader_eval, loader_de)
+
+    - loader_train: training loader (may be None if your pipeline does not train per-epoch)
+    - loader_eval : evaluation/validation loader (used for scoring accuracy/precision)
+    - loader_de   : loader used during DE/PSO fitness evaluations (usually the train loader)
+    """
+    # --- Prevent UnboundLocalError by initializing locals
+    loader_train: Optional[DataLoader] = None
+    loader_eval: Optional[DataLoader] = None
+    loader_de: Optional[DataLoader] = None
+
+    # Seed everything (if enabled)
+    _set_seed(getattr(a, 'seed', 0))
+
+    # Decide dataset
+    dataset_name = getattr(a, 'dataset', None)
+    if dataset_name is None:
+        dataset_name = _infer_dataset_name(getattr(a, 'num_classes', 100))
+        setattr(a, 'dataset', dataset_name)
+
+    # Reconcile args.num_classes with dataset, warn if mismatch
+    expected_classes = 10 if dataset_name == 'cifar10' else 100
+    if int(getattr(a, 'num_classes', expected_classes)) != expected_classes:
+        print(f"[warn] Overriding --num_classes={a.num_classes} to {expected_classes} for {dataset_name}.")
+        a.num_classes = expected_classes
+
+    # Build loaders
+    if dataset_name in ('cifar10', 'cifar100'):
+        classes, tr_loader, va_loader, de_loader = _build_cifar_loaders(
+            name=dataset_name,
+            root=getattr(a, 'data', './data'),
+            train_bs=getattr(a, 'de_batch_size', 128),
+            test_bs=getattr(a, 'test_batch_size', 256),
+            workers_train=getattr(a, 'workers', 2),
+            workers_val=getattr(a, 'workers_val', 2),
+        )
+        # expose resolved class-count just in case
+        a.num_classes = classes
+
+        loader_train = tr_loader
+        loader_eval  = va_loader
+        loader_de    = de_loader
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+
+    # Final sanity
+    if loader_eval is None or loader_de is None:
+        raise RuntimeError(f"Failed to build loaders for dataset={dataset_name} "
+                           f"(loader_eval={loader_eval}, loader_de={loader_de}).")
     return loader_train, loader_eval, loader_de
 
 
-
+__all__ = ["args", "args_text", "amp_autocast", "obtain_loader", "parser"]

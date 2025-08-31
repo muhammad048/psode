@@ -99,7 +99,8 @@ def distribute_bn(model, world_size, reduce=True):
 class NativeScaler:
     state_dict_key = "amp_scaler"
     def __init__(self):
-        self._scaler = torch.cuda.amp.GradScaler()
+        #self._scaler = torch.cuda.amp.GradScaler()
+        self._scaler = torch.amp.GradScaler('cuda')
 
     def __call__(self, loss, optimizer, create_graph=False):
         self._scaler.scale(loss).backward(create_graph=create_graph)
