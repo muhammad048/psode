@@ -42,6 +42,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         help='experiment tag for output dir names')
     parser.add_argument('--model', default='SEW_resnet34', type=str,
                         help='label used in saved filenames')
+    parser.add_argument('--slice_len', default=0, type=int,
+                        help='>0 caps eval batches; 0 uses full loader')
+    parser.add_argument('--log_interval', default=50, type=int,
+                        help='How often (in batches) to log validation progress')
 
     # Compute / performance
     parser.add_argument('--num-gpu', default=1, type=int, metavar='N',
@@ -195,6 +199,8 @@ def obtain_loader(a=args):
 
     if loader_eval is None or loader_de is None:
         raise RuntimeError(f"Failed to build loaders for dataset={dataset_name}")
+    if not hasattr(args, 'slice_len') or args.slice_len is None:
+        args.slice_len = getattr(args, 'de_slice_len', 0)
     return loader_train, loader_eval, loader_de
 
 __all__ = ["args", "args_text", "amp_autocast", "obtain_loader"]

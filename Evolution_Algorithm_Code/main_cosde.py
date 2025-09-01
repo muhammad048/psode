@@ -1,3 +1,8 @@
+import sys, os
+# Add the project root: E:/AML/CADE4SNN-main
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, project_root)
+
 import os
 import time
 import shutil
@@ -7,93 +12,75 @@ from collections import OrderedDict
 from itertools import islice
 import numpy as np
 import random as pyrandom
-import math
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 
 from utils.snn_model import SEW
+import math
 from utils.data import population_info as pop_info
+from utils.models import create_model, load_checkpoint
 from utils.tools import resume
 from utils.tools.utility import *
 from utils.tools.option_de import args, args_text, amp_autocast, obtain_loader
 from utils.tools.de import de
-from utils.tools.pso import PSOOptimizer
 from utils.tools.spe import model_dict_to_vector, model_vector_to_dict
+from utils.tools.plot_utils_ import plot_top1_vs_baseline
 from utils.tools import val
 from utils.tools.greedy_soup_ann import greedy_soup, test_ood, test_single_model_ood
 from spikingjelly.clock_driven import functional
 
 _logger = logging.getLogger('train')
 
+
 def main():
     os.environ['WANDB_MODE'] = 'offline'
     setup_default_logging(log_path=args.log_dir)
     logging.basicConfig(level=logging.DEBUG, filename=args.log_dir, filemode='a')
-
-    # rank may not exist outside DDP
     random_seed(args.seed, getattr(args, 'rank', 0))
 
-    # loaders
-    _, loader_eval, loader_de = obtain_loader(args)
+    # ---- dataloaders (match your working CADE main)
+    # from utils.tools.option_de import obtain_loader  # (not used here)
+    from finetune_hyperparameter.utils.data.cifar_loader_1 import create_loader_cifar_10
+    loader_train, loader_eval = create_loader_cifar_10(args)
+    loader_de = loader_eval  # keep your choice
 
-    # val.validate expects args.slice_len
-    if not hasattr(args, 'slice_len'):
-        args.slice_len = getattr(args, 'de_slice_len', 0)
+    # ---- model (match your working CADE main)
+    model = SEW.resnet18(num_classes=100, g="add", down='max', T=4)
 
-    # model
-    model = SEW.resnet34(num_classes=args.num_classes, g="add", down='max', T=4)
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if getattr(args, 'local_rank', 0) == 0:
-        _logger.info(f"Creating model...{args.model}, number of params: {n_parameters}")
+        _logger.info(f"Creating model...sew_18,\n number of params: {n_parameters}")
     model = model.cuda().to(memory_format=torch.channels_last)
 
-    # seed population from checkpoints
+    # ---- population seeds (same repeated path list pattern)
     load_score = False
-    models_path = []
-    if getattr(args, 'pop_init', None):
-        base = os.path.basename(args.pop_init)
-        if base.split('_')[-1] == 'score.txt':
-            load_score = True
-            score, acc1, acc5, val_loss, en_metrics, models_path = pop_info.get_path_with_acc(args.pop_init)
-        else:
-            models_path = pop_info.get_path(args.pop_init)
-
-    if not models_path:
-        # fallback: replicate one ckpt if none given
+    if os.path.basename(args.pop_init).split('_')[-1] == 'score.txt':
+        load_score = True
+        score, acc1, acc5, val_loss, en_metrics, models_path = pop_info.get_path_with_acc(args.pop_init)
+    else:
         models_path = [
-            r"E:\PSO\PSOCADE4SNN-main\finetune_hyperparameter\checkpoints\train\20250825-211457-exp_debug\exp_debug_0.pt",
-        ] * max(1, args.popsize)
+            r"E:/AML/CADE4SNN-main/finetune_hyperparameter/checkpoints/train/20250825-211457-exp_debug/exp_debug_0.pt",
+            r"E:/AML/CADE4SNN-main/finetune_hyperparameter/checkpoints/train/20250825-211457-exp_debug/exp_debug_0.pt",
+            r"E:/AML/CADE4SNN-main/finetune_hyperparameter/checkpoints/train/20250825-211457-exp_debug/exp_debug_0.pt",
+            r"E:/AML/CADE4SNN-main/finetune_hyperparameter/checkpoints/train/20250825-211457-exp_debug/exp_debug_0.pt",
+            r"E:/AML/CADE4SNN-main/finetune_hyperparameter/checkpoints/train/20250825-211457-exp_debug/exp_debug_0.pt",
+            r"E:/AML/CADE4SNN-main/finetune_hyperparameter/checkpoints/train/20250825-211457-exp_debug/exp_debug_0.pt",
+        ]
 
     population = []
     for resume_path in models_path:
-        if getattr(args, 'local_rank', 0) == 0:
-            print(resume_path)
+        print(resume_path)
         resume.load_checkpoint(model, resume_path, log_info=getattr(args, 'local_rank', 0) == 0)
         solution = model_dict_to_vector(model).detach()
         population.append(solution)
 
-    # diversity injection if all clones
-    try:
-        if len(population) >= 2:
-            _stack = torch.stack(population)
-            if (_stack[1:] - _stack[:1]).abs().max().item() < 1e-12:
-                _base_std = _stack.std().item()
-                _noise_scale = max(1e-3 * (_base_std if _base_std > 0 else 1.0), 1e-4)
-                population = [p + _noise_scale * torch.randn_like(p) for p in population]
-                if getattr(args, 'local_rank', 0) == 0:
-                    _logger.info(f"Population cloned; injected Gaussian noise with scale {_noise_scale:.2e}")
-    except Exception as _e:
-        if getattr(args, 'local_rank', 0) == 0:
-            _logger.warning(f"Gaussian diversity injection skipped due to error: {_e}")
-
-    # optional DDP
     if getattr(args, 'distributed', False):
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = NativeDDP(model, device_ids=[getattr(args, 'local_rank', 0)])
 
-    # output dir snapshot
+    # ---- output dir snapshot
     if getattr(args, 'local_rank', 0) == 0:
         output_base = args.output if args.output else './output'
         exp_name = '-'.join([datetime.now().strftime("%Y%m%d-%H%M%S"), args.exp_name])
@@ -103,70 +90,71 @@ def main():
         shutil.copytree(os.path.join(current_dir, 'utils'), os.path.join(output_dir, 'utils'))
         for filename in os.listdir(current_dir):
             if filename.endswith('.py') or filename.endswith('.sh'):
-                shutil.copy(os.path.join(current_dir, filename), os.path.join(output_dir, filename))
+                src_path = os.path.join(current_dir, filename)
+                dst_path = os.path.join(output_dir, filename)
+                shutil.copy(src_path, dst_path)
         with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
             f.write(args_text)
 
-    # baseline scoring
+    # ---- baseline scoring
     args.popsize = len(models_path)
-    acc1, acc5, val_loss = [torch.zeros(args.popsize).tolist() for _ in range(3)]
-
     if not load_score:
         score = score_func(model, population, loader_de, args)
-
         if getattr(args, 'test_ood', False):
             greedy_model_dict = greedy_soup(population, score, model, loader_de, args, amp_autocast=amp_autocast)
             model.load_state_dict(greedy_model_dict)
             greedy_metrics = val.validate(model, loader_eval, args, amp_autocast=amp_autocast)
             ood_metrics = test_ood(greedy_model_dict, args, model, population, args.popsize, amp_autocast=amp_autocast)
-
+        acc1, acc5, val_loss = [torch.zeros(args.popsize).tolist() for _ in range(3)]
         for i in range(args.popsize):
             solution = population[i]
             model_weights_dict = model_vector_to_dict(model=model, weights_vector=solution)
             model.load_state_dict(model_weights_dict)
             temp = val.validate(model, loader_eval, args, amp_autocast=amp_autocast)
             acc1[i], acc5[i], val_loss[i] = temp['top1'], temp['top5'], temp['loss']
-
         en_metrics = val.validate_ensemble(model, population, args.popsize, loader_eval, args, amp_autocast=amp_autocast)
-
-        if getattr(args, 'pop_init', None):
-            pop_info.write_path_with_acc(score, acc1, acc5, val_loss, en_metrics, models_path, args.pop_init)
-    else:
-        en_metrics = en_metrics
+        pop_info.write_path_with_acc(score, acc1, acc5, val_loss, en_metrics, models_path, args.pop_init)
 
     if getattr(args, 'local_rank', 0) == 0:
-        update_summary('baselines:', OrderedDict(en_metrics), os.path.join(args.output_dir, 'summary.csv'), write_header=True)
+        update_summary('baselines:', OrderedDict(en_metrics), os.path.join(output_dir, 'summary.csv'), write_header=True)
         if getattr(args, 'test_ood', False):
-            update_summary('greedy_val:', greedy_metrics, os.path.join(args.output_dir, 'summary.csv'), write_header=True)
-            update_summary('greedy_and_ensemble_ood:', ood_metrics, os.path.join(args.output_dir, 'summary.csv'), write_header=True)
-
+            update_summary('greedy_val:', greedy_metrics, os.path.join(output_dir, 'summary.csv'), write_header=True)
+            update_summary('greedy_and_ensemble_ood:', ood_metrics, os.path.join(output_dir, 'summary.csv'), write_header=True)
     rowd = OrderedDict([('score', score), ('top1', acc1), ('top5', acc5), ('val_loss', val_loss)])
     if getattr(args, 'local_rank', 0) == 0:
         bestidx = score.index(max(score))
         _logger.info('epoch:{}, best_score:{:>7.4f}, best_idx:{}, score: {}'.format(0, max(score), bestidx, score))
-        update_summary(0, rowd, os.path.join(args.output_dir, 'summary.csv'), write_header=True)
+        update_summary(0, rowd, os.path.join(output_dir, 'summary.csv'), write_header=True)
 
     print("score", score)
 
-    # ---- PSO: tune (F, CR) before DE (maximization) ----
+    # =====================================================================
+    # Optional PSO phase to pick (F, CR) BEFORE full DE (MAXIMIZE fitness)
+    # =====================================================================
     f, cr = args.f_init, args.cr_init
     if getattr(args, 'use_pso', False):
         if getattr(args, 'local_rank', 0) == 0:
-            _logger.info(f"Starting PSO to tune (F, CR) with pop={args.pso_popsize}, iters={args.pso_iters}, eval_gens={args.pso_eval_gens}")
+            _logger.info(
+                f"Starting PSO to tune (F, CR) with pop={args.pso_popsize}, "
+                f"iters={args.pso_iters}, eval_gens={args.pso_eval_gens}"
+            )
 
         def _eval_particle(_particle):
             _F, _CR = float(_particle[0]), float(_particle[1])
             _temp_pop = [p.clone() for p in population]
-            _best_scores = []
+            best_scores = []
             for _ in range(max(1, args.pso_eval_gens)):
                 _temp_pop, _upd, _scores = de(args.popsize, _F, _CR, _temp_pop, model, loader_de, args)
                 try:
-                    _best_scores.append(float(max(_scores)))
+                    best_scores.append(float(max(_scores)))
                 except Exception:
-                    _best_scores.append(0.0)
-            return float(np.mean(_best_scores))  # maximize accuracy
+                    best_scores.append(0.0)
+            return float(np.mean(best_scores))  # PSO maximizes this
 
-        _pso = PSOOptimizer(pop_size=args.pso_popsize, F_bounds=(0.1, 0.9), CR_bounds=(0.1, 0.99), max_iters=args.pso_iters)
+        from utils.tools.pso import PSOOptimizer
+        _pso = PSOOptimizer(
+            pop_size=args.pso_popsize, F_bounds=(0.1, 0.9), CR_bounds=(0.1, 0.99), max_iters=args.pso_iters
+        )
         gbest, gbest_fit = _pso.optimize(_eval_particle)
         f, cr = float(gbest[0]), float(gbest[1])
         if getattr(args, 'local_rank', 0) == 0:
@@ -178,15 +166,15 @@ def main():
     max_acc_train = 0
     max_acc_val = 0
 
-    # ---- DE generations (use all) ----
-    for epoch in range(args.de_epochs):
+    # ---- DE loop
+    for epoch in range(1, args.de_epochs):
         epoch_time = AverageMeter()
         end = time.time()
 
         print("cr f", cr, f)
         population, update_label, score = de(args.popsize, f, cr, population, model, loader_de, args)
 
-        # cosine drift for F/CR only if PSO disabled
+        # cosine drift for F/CR only if PSO is disabled
         if not getattr(args, 'use_pso', False):
             fcr_min = 1e-6
             f = fcr_min + (args.f_init - fcr_min) * (1 + math.cos(math.pi * epoch / 40)) / 2 + pyrandom.uniform(fcr_min, args.f_init)
@@ -194,15 +182,16 @@ def main():
 
         if getattr(args, 'local_rank', 0) == 0:
             bestidx = score.index(max(score))
-            _logger.info('epoch:{}, best_score:{:>7.4f}, best_idx:{}, score: {}'.format(epoch, max(score), bestidx, score))
+            _logger.info('epoch:{}, best_score:{:>7.4f}, best_idx:{}, score: {}'.format(0, max(score), bestidx, score))
             pop_tensor = torch.stack(population)
             if max(score) > max_acc_train:
                 max_acc_train = max(score)
                 print("Best in train_set update and train acc = ", max_acc_train)
-                model_path = os.path.join(args.output_dir, f'train_best_{args.model}.pt')
+                model_path = os.path.join(output_dir, f'train_best_{args.model}.pt')
                 print('Saving model to', model_path)
                 torch.save(model.state_dict(), model_path)
-        else:
+
+        if getattr(args, 'local_rank', 0) != 0:
             update_label = list(range(args.popsize))
             pop_tensor = torch.stack(population)
 
@@ -213,18 +202,17 @@ def main():
             torch.distributed.broadcast(pop_tensor, src=0)
 
         population = list(pop_tensor)
-
         for i in range(args.popsize):
             if update_label[i] == 1:
                 solution = population[i]
                 model_weights_dict = model_vector_to_dict(model=model, weights_vector=solution)
                 model.load_state_dict(model_weights_dict)
-                temp = val.validate(model, loader_eval, args, amp_autocast=amp_autocast)
-                acc1[i], acc5[i], val_loss[i] = temp['top1'], temp['top5'], temp['loss']
+                tmp = val.validate(model, loader_eval, args, amp_autocast=amp_autocast)
+                acc1[i], acc5[i], val_loss[i] = tmp['top1'], tmp['top5'], tmp['loss']
                 if acc1[i] > max_acc_val:
                     max_acc_val = acc1[i]
                     print("Best in train_set update and val acc = ", max_acc_val)
-                    model_path = os.path.join(args.output_dir, f'val_best_{args.model}.pt')
+                    model_path = os.path.join(output_dir, f'val_best_{args.model}.pt')
                     print('Saving best val model to', model_path)
                     torch.save(model.state_dict(), model_path)
 
@@ -236,12 +224,13 @@ def main():
 
         if getattr(args, 'local_rank', 0) == 0:
             rowd = OrderedDict([('best_idx', bestidx), ('score', score), ('top1', acc1), ('top5', acc5), ('val_loss', val_loss)])
-            update_summary(epoch, rowd, os.path.join(args.output_dir, 'summary.csv'), write_header=True)
+            update_summary(epoch, rowd, os.path.join(output_dir, 'summary.csv'), write_header=True)
             if args.de_epochs - args.popsize <= epoch <= args.de_epochs - 1:
                 model_path = os.path.join(args.output_dir, f'{args.exp_name}_{epoch}.pt')
                 print('Saving model to', model_path)
                 torch.save(model.state_dict(), model_path)
 
+    # tidy W&B if present (your original file had finish() unguarded)
     try:
         import wandb
         wandb.finish()
@@ -271,7 +260,6 @@ def score_func(model, population, loader_de, args):
             input = input.contiguous(memory_format=torch.channels_last)
             with amp_autocast():
                 output, _ = model(input)
-            from spikingjelly.clock_driven import functional
             functional.reset_net(model)
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
             if getattr(args, 'distributed', False):
